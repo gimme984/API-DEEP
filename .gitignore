@@ -1,0 +1,23 @@
+# Node.js (JavaScript)
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+.env
+
+# PHP / Composer
+vendor/
+.phpunit.result.cache
+Homestead.json
+Homestead.yaml
+
+# Arquivos do Sistema / IDEs
+.DS_Store
+.idea/
+.vscode/
