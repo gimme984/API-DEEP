@@ -1,0 +1,199 @@
+from rest_framework import viewsets, permissions, filters, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from django.utils import timezone
+from .models import Chamado, Comentario, Anexo
+from .serializers import ChamadoSerializer, ComentarioSerializer, AnexoSerializer
+from accounts.models import User
+import logging
+import os
+import subprocess
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class ChamadoViewSet(viewsets.ModelViewSet):
+    queryset = Chamado.objects.all()
+    serializer_class = ChamadoSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['titulo', 'descricao']
+    ordering_fields = ['criado_em', 'prioridade', 'status']
+    
+    def get_queryset(self):
+        user = self.request.user
+        if hasattr(user, 'funcao') and user.funcao in ['TECNICO', 'ADMIN_TI']:
+            return Chamado.objects.all()
+        return Chamado.objects.filter(solicitante=user)
+    
+    def perform_create(self, serializer):
+        chamado = serializer.save(solicitante=self.request.user)
+        from notificacoes.models import Notificacao
+        tecnicos = User.objects.filter(funcao__in=['TECNICO', 'ADMIN_TI'])
+        for tecnico in tecnicos:
+            Notificacao.objects.create(
+                usuario=tecnico,
+                tipo='NOVO_CHAMADO',
+                titulo=f'Novo Chamado #{chamado.id}',
+                mensagem=f'{self.request.user.get_full_name() or self.request.user.username} abriu: {chamado.titulo}',
+                link=f'/chamado/{chamado.id}',
+                lida=False
+            )
+    
+    @action(detail=True, methods=['post'])
+    def adicionar_anexo(self, request, pk=None):
+        chamado = self.get_object()
+        arquivo = request.FILES.get('arquivo')
+        nome = request.data.get('nome', arquivo.name if arquivo else 'anexo')
+        if not arquivo:
+            return Response({'error': 'Arquivo é obrigatório'}, status=400)
+        anexo = Anexo.objects.create(
+            chamado=chamado,
+            arquivo=arquivo,
+            nome=nome,
+            enviado_por=request.user
+        )
+        serializer = AnexoSerializer(anexo)
+        return Response(serializer.data, status=201)
+    
+    @action(detail=True, methods=['post'])
+    def adicionar_comentario(self, request, pk=None):
+        chamado = self.get_object()
+        if chamado.status in ['RESOLVIDO', 'FECHADO']:
+            return Response({'error': 'Não é possível adicionar comentários em chamados resolvidos ou fechados'}, status=403)
+        texto = request.data.get('texto')
+        if not texto:
+            return Response({'error': 'Texto do comentário é obrigatório'}, status=400)
+        comentario = Comentario.objects.create(
+            chamado=chamado,
+            autor=request.user,
+            texto=texto,
+            is_sistema=False
+        )
+        serializer = ComentarioSerializer(comentario)
+        return Response(serializer.data, status=201)
+
+class ComentarioViewSet(viewsets.ModelViewSet):
+    serializer_class = ComentarioSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    def get_queryset(self):
+        return Comentario.objects.filter(chamado_id=self.kwargs.get('chamado_pk'))
+    def perform_create(self, serializer):
+        chamado = Chamado.objects.get(id=self.kwargs.get('chamado_pk'))
+        if chamado.status in ['RESOLVIDO', 'FECHADO']:
+            raise serializers.ValidationError('Não é possível adicionar comentários em chamados resolvidos ou fechados')
+        serializer.save(chamado=chamado, autor=self.request.user)
+
+class AnexoViewSet(viewsets.ModelViewSet):
+    serializer_class = AnexoSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    def get_queryset(self):
+        return Anexo.objects.filter(chamado_id=self.kwargs.get('chamado_pk'))
+    def perform_create(self, serializer):
+        chamado = Chamado.objects.get(id=self.kwargs.get('chamado_pk'))
+        serializer.save(chamado=chamado, enviado_por=self.request.user)
+
+class BackupView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        user = request.user
+        if user.funcao != 'ADMIN_TI':
+            return Response({'error': 'Acesso negado'}, status=403)
+        backup_dir = '/app/backup'
+        backups = []
+        if os.path.exists(backup_dir):
+            for file in os.listdir(backup_dir):
+                if file.endswith('.sql'):
+                    file_path = os.path.join(backup_dir, file)
+                    stat = os.stat(file_path)
+                    backups.append({
+                        'nome': file,
+                        'tamanho': stat.st_size,
+                        'data': datetime.fromtimestamp(stat.st_mtime).isoformat()
+                    })
+        backups.sort(key=lambda x: x['data'], reverse=True)
+        return Response({'backups': backups})
+    
+    def post(self, request):
+        user = request.user
+        if user.funcao != 'ADMIN_TI':
+            return Response({'error': 'Acesso negado'}, status=403)
+        backup_dir = '/app/backup'
+        os.makedirs(backup_dir, exist_ok=True)
+        date = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'backup_{date}.sql'
+        filepath = os.path.join(backup_dir, filename)
+        try:
+            # Usando pg_dump diretamente (cliente PostgreSQL deve estar instalado)
+            cmd = f'PGPASSWORD=senha123 pg_dump -h db -U admin tickets > {filepath}'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                return Response({'message': f'Backup criado: {filename}', 'success': True})
+            else:
+                return Response({'error': result.stderr or 'Falha ao criar backup'}, status=500)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class DownloadBackupView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request, filename):
+        user = request.user
+        if user.funcao != 'ADMIN_TI':
+            return Response({'error': 'Acesso negado'}, status=403)
+        from django.http import FileResponse
+        file_path = f'/app/backup/{filename}'
+        if os.path.exists(file_path):
+            return FileResponse(open(file_path, 'rb'), as_attachment=True, filename=filename)
+        return Response({'error': 'Arquivo não encontrado'}, status=404)
+
+class MetricasView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    def get(self, request):
+        user = request.user
+        from django.db.models import Count
+        from datetime import timedelta
+        from django.utils import timezone
+        hoje = timezone.now()
+        inicio_semana = hoje - timedelta(days=7)
+        if user.funcao in ['TECNICO', 'ADMIN_TI']:
+            queryset = Chamado.objects.all()
+        else:
+            queryset = Chamado.objects.filter(solicitante=user)
+        chamados_resolvidos = queryset.filter(status='RESOLVIDO', resolvido_em__isnull=False)
+        tempo_medio = 0
+        for chamado in chamados_resolvidos:
+            if chamado.resolvido_em and chamado.criado_em:
+                diff = chamado.resolvido_em - chamado.criado_em
+                tempo_medio += diff.total_seconds() / 3600
+        if chamados_resolvidos.count() > 0:
+            tempo_medio = round(tempo_medio / chamados_resolvidos.count(), 1)
+        abertos_7dias = queryset.filter(criado_em__gte=inicio_semana).count()
+        resolvidos_7dias = queryset.filter(status='RESOLVIDO', resolvido_em__gte=inicio_semana).count()
+        ranking = []
+        if user.funcao in ['TECNICO', 'ADMIN_TI']:
+            tecnicos = User.objects.filter(funcao__in=['TECNICO', 'ADMIN_TI']).annotate(
+                total_resolvidos=Count('chamados_resolvidos')
+            ).filter(total_resolvidos__gt=0).order_by('-total_resolvidos')[:5]
+            ranking = [{'nome': t.get_full_name() or t.username, 'total': t.total_resolvidos} for t in tecnicos]
+        prioridades = [
+            {'prioridade': 'Baixa', 'total': queryset.filter(prioridade='BAIXA').count()},
+            {'prioridade': 'Média', 'total': queryset.filter(prioridade='MEDIA').count()},
+            {'prioridade': 'Alta', 'total': queryset.filter(prioridade='ALTA').count()},
+            {'prioridade': 'Crítica', 'total': queryset.filter(prioridade='CRITICA').count()}
+        ]
+        dias_semana = []
+        for i in range(6, -1, -1):
+            dia = hoje - timedelta(days=i)
+            dia_str = dia.strftime('%d/%m')
+            abertos = queryset.filter(criado_em__date=dia.date()).count()
+            resolvidos = queryset.filter(status='RESOLVIDO', resolvido_em__date=dia.date()).count()
+            dias_semana.append({'dia': dia_str, 'abertos': abertos, 'resolvidos': resolvidos})
+        return Response({
+            'tempo_medio_resolucao': tempo_medio,
+            'abertos_7dias': abertos_7dias,
+            'resolvidos_7dias': resolvidos_7dias,
+            'ranking_tecnicos': ranking,
+            'prioridades': prioridades,
+            'tendencia_semanal': dias_semana
+        })

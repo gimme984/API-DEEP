@@ -1,0 +1,5 @@
+# Backup do banco às 2h da manhã
+0 2 * * * cd /app && /app/backup/backup.sh >> /app/backup/backup.log 2>&1
+
+# Backup dos arquivos às 3h da manhã
+0 3 * * * cd /app && /app/backup/backup_files.sh >> /app/backup/backup.log 2>&1
